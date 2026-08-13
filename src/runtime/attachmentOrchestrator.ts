@@ -78,6 +78,7 @@ export class AttachmentOrchestrator {
 				maxAttachmentSizeKB: runtimeConfig.maxAttachmentSizeKB,
 				attachmentConcurrency: runtimeConfig.attachmentConcurrency,
 				debug: runtimeConfig.debug,
+				encryptAttachments: runtimeConfig.encryptAttachments,
 				trace: this.deps.getTraceHttpContext(),
 			},
 			this.deps.getBlobHashCache(),

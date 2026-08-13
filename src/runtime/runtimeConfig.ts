@@ -14,6 +14,7 @@ export interface RuntimeConfig {
 	externalEditPolicy: ExternalEditPolicy;
 	enableAttachmentSync: boolean;
 	attachmentSyncExplicitlyConfigured: boolean;
+	encryptAttachments: boolean;
 	maxAttachmentSizeKB: number;
 	attachmentConcurrency: number;
 	showRemoteCursors: boolean;
@@ -39,6 +40,7 @@ export function buildRuntimeConfig(
 		externalEditPolicy: settings.externalEditPolicy,
 		enableAttachmentSync: settings.enableAttachmentSync,
 		attachmentSyncExplicitlyConfigured: settings.attachmentSyncExplicitlyConfigured,
+		encryptAttachments: settings.encryptAttachments,
 		maxAttachmentSizeKB: settings.maxAttachmentSizeKB,
 		attachmentConcurrency: settings.attachmentConcurrency,
 		showRemoteCursors: settings.showRemoteCursors,

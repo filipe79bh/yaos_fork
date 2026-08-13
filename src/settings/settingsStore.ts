@@ -46,6 +46,8 @@ export interface VaultSyncSettings {
 	enableAttachmentSync: boolean;
 	/** True once the user has explicitly changed the attachment sync toggle. */
 	attachmentSyncExplicitlyConfigured: boolean;
+	/** Custom fork: encrypt attachment bytes client-side (AES-256-GCM) before upload to R2. */
+	encryptAttachments: boolean;
 	/** Maximum attachment size in KB. Files larger are skipped. Capped at 10240 (10 MB). */
 	maxAttachmentSizeKB: number;
 	/** Number of parallel upload/download slots. */
@@ -72,6 +74,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	externalEditPolicy: "always",
 	enableAttachmentSync: true,
 	attachmentSyncExplicitlyConfigured: false,
+	encryptAttachments: true,
 	maxAttachmentSizeKB: MAX_ATTACHMENT_SIZE_KB,
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
@@ -119,6 +122,10 @@ export function readVaultSyncSettings(
 		if (data?.enableAttachmentSync !== true) {
 			settings.enableAttachmentSync = true;
 		}
+		migrated = true;
+	}
+	if (typeof settings.encryptAttachments !== "boolean") {
+		settings.encryptAttachments = DEFAULT_SETTINGS.encryptAttachments;
 		migrated = true;
 	}
 	if (

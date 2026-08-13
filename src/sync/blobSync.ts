@@ -36,6 +36,7 @@ import {
 	removeCachedHash,
 } from "./blobHashCache";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import { LazyBlobEnvelopeCrypto, type BlobEnvelopeCrypto } from "../crypto/envelope";
 
 // -------------------------------------------------------------------
 // Config
@@ -116,6 +117,7 @@ class BlobHttpClient {
 		private host: string,
 		private token: string,
 		private vaultId: string,
+		private crypto: BlobEnvelopeCrypto | null,
 		private trace?: TraceHttpContext,
 	) {}
 
@@ -141,13 +143,23 @@ class BlobHttpClient {
 		data: ArrayBuffer,
 		timeoutMs: number,
 	): Promise<void> {
+		// Zero-knowledge fork: encrypt bytes client-side before upload.
+		// The server only ever stores opaque ciphertext keyed by the
+		// plaintext hash. The real content type is withheld to avoid
+		// leaking file type via object metadata.
+		let body: ArrayBuffer = data;
+		let sentContentType = contentType;
+		if (this.crypto) {
+			body = await this.crypto.encrypt(data);
+			sentContentType = "application/octet-stream";
+		}
 		const res = await withTimeout(
 			requestUrl({
 				url: this.url(`/${hash}`),
 				method: "PUT",
 				headers: this.authHeaders(),
-				body: data,
-				contentType,
+				body,
+				contentType: sentContentType,
 			}),
 			timeoutMs,
 			`blob upload ${hash.slice(0, 12)}…`,
@@ -170,7 +182,11 @@ class BlobHttpClient {
 		if (res.status !== 200) {
 			throw new Error(`blob download failed: ${res.status} ${res.text}`);
 		}
-		return res.arrayBuffer;
+		const data = res.arrayBuffer;
+		if (this.crypto) {
+			return await this.crypto.decrypt(data);
+		}
+		return data;
 	}
 
 	async exists(hashes: string[]): Promise<string[]> {
@@ -405,6 +421,7 @@ export class BlobSyncManager {
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
 			debug: boolean;
+			encryptAttachments: boolean;
 			trace?: TraceHttpContext;
 		},
 		hashCache: BlobHashCache,
@@ -416,6 +433,9 @@ export class BlobSyncManager {
 			settings.host,
 			settings.token,
 			settings.vaultId,
+			settings.encryptAttachments
+				? new LazyBlobEnvelopeCrypto(settings.token, true)
+				: null,
 			settings.trace,
 		);
 		this.maxConcurrency = settings.attachmentConcurrency;

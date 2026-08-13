@@ -363,6 +363,24 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				);
 		}
 
+			if (attachmentsAvailable || !this.host.settings.host) {
+				new Setting(containerEl)
+					.setName("Encrypt attachments")
+					.setDesc(
+						"Custom fork: encrypt attachment bytes with AES-256-GCM before uploading to R2. The key is derived from your sync token. Disable only if you need to interop with non-encrypting clients.",
+					)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.encryptAttachments)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.encryptAttachments = value;
+							}, "settings:attachment-encryption");
+							this.display();
+						}),
+				);
+			}
+
 			if ((attachmentsAvailable || !this.host.settings.host) && this.host.settings.enableAttachmentSync) {
 				new Setting(containerEl)
 					.setName("Max attachment size in kilobytes")
