@@ -4,6 +4,8 @@ import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { runSerialized, runSingleFlight } from "./asyncConcurrency";
 import {
 	buildDocumentSummary,
+	readMetaPath,
+	isMetaDeleted,
 	type DocumentSummary,
 } from "./documentSummary";
 import { reapTombstonedBodies, type ReapResult } from "./tombstoneReaper";
@@ -26,7 +28,7 @@ import {
 	TraceRateLimiter,
 	type TraceEntry as StoredTraceEntry,
 } from "./traceStore";
-import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
+import { trySendSvEcho, makeSvEchoCustomMessageForDoc, type SvEchoSendResult } from "./svEcho";
 import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
 import { bytesToHex } from "./hex";
 import { sha256Hex } from "./hex";
@@ -36,6 +38,7 @@ import {
 } from "./persistenceCoordinator";
 import type { LoadedDocState } from "./sqlDocStore";
 import type { Env } from "./routes/types";
+import { VaultIndexStore, chunkMarkdown, chunkIdFor } from "./indexQueue";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -191,7 +194,169 @@ export class VaultSyncServer extends YServer<Env> {
 		if (!result.success) {
 			console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
 		}
+		// Fork fix: after a successful save the persistence generation has
+		// advanced.  Broadcast a post-apply sv-echo to every open connection so
+		// clients can confirm their local receipts (the server only echoes on
+		// connect/update otherwise, so a single save would never confirm).
+		if (result.success) {
+			await this.broadcastSvEchoToConnections();
+			await this.flushIndexDirty();
+		}
 		await this.syncRoomMetaFromDocument();
+	}
+
+	// ------------------------------------------------------------------
+	// Fork feature: write-time index snapshots (docs_index → Vectorize)
+	// ------------------------------------------------------------------
+
+	private indexStore: VaultIndexStore | null = null;
+	private indexDirty = new Set<string>();
+	private indexObserverAttached = false;
+	private indexReconciled = false;
+	private indexReconcilePromise: Promise<void> | null = null;
+
+	private getIndexStore(): VaultIndexStore | null {
+		if (!this.ctx.storage.sql) return null;
+		if (!this.indexStore) {
+			this.indexStore = new VaultIndexStore(this.ctx.storage);
+		}
+		// Lazy reconcile: catch up the queue whenever the store is first
+		// touched on a warm instance (covers pre-deploy warm DOs). Returns a
+		// promise so consumers can await completion before reading stats.
+		if (!this.indexReconciled) {
+			this.indexReconciled = true;
+			this.attachIndexObservers();
+			this.indexReconcilePromise = this.reconcileIndex();
+		}
+		return this.indexStore;
+	}
+
+	private async awaitIndexReconcile(): Promise<void> {
+		this.getIndexStore();
+		if (this.indexReconcilePromise) {
+			try {
+				await this.indexReconcilePromise;
+			} catch {
+				// reconcile failures are already logged; stats fall back to zeros
+			}
+		}
+	}
+
+	/**
+	 * Attach a one-time observer that records changed fileIds (cheap).
+	 * Runs once per DO wake; the full reconcile below covers eviction gaps.
+	 */
+	private attachIndexObservers(): void {
+		if (this.indexObserverAttached) return;
+		this.indexObserverAttached = true;
+		this.document.getMap("idToText").observe((ev) => {
+			for (const fileId of ev.keysChanged) {
+				this.indexDirty.add(fileId);
+			}
+		});
+	}
+
+	/**
+	 * Flush dirty fileIds into docs_index (called after each successful save).
+	 * Cheap: only changed docs, single-threaded in the DO.
+	 */
+	private async flushIndexDirty(): Promise<void> {
+		const store = this.getIndexStore();
+		if (!store) return;
+		if (this.indexDirty.size === 0) return;
+		const meta = this.document.getMap("meta");
+		const idToText = this.document.getMap("idToText");
+		const dirty = [...this.indexDirty];
+		this.indexDirty.clear();
+		for (const fileId of dirty) {
+			const metaEntry = meta.get(fileId);
+			const path = readMetaPath(metaEntry);
+			if (!path) continue;
+			if (isMetaDeleted(metaEntry) || !idToText.has(fileId)) {
+				store.markChangedIfDifferent(path, null);
+				continue;
+			}
+			const ytext = idToText.get(fileId);
+			store.markChangedIfDifferent(path, ytext?.toString() ?? null);
+		}
+	}
+
+	/**
+	 * Full reconcile: walk the CRDT once per DO wake and mark anything whose
+	 * stored hash differs. Catches rows missed by observers during eviction.
+	 * Ensures the document is hydrated first (the DO may have been woken by a
+	 * stats/claim call that deliberately skips document load).
+	 */
+	private async reconcileIndex(): Promise<void> {
+		const store = this.getIndexStore();
+		if (!store) return;
+		try {
+			await this.ensureDocumentLoaded();
+			const meta = this.document.getMap("meta");
+			const idToText = this.document.getMap("idToText");
+			meta.forEach((value: unknown, fileId: string) => {
+				const path = readMetaPath(value);
+				if (!path) return;
+				if (isMetaDeleted(value) || !idToText.has(fileId)) {
+					store.markChangedIfDifferent(path, null);
+					return;
+				}
+				const ytext = idToText.get(fileId);
+				if (!ytext) return;
+				const text = ytext.toString();
+				store.markChangedIfDifferent(path, text);
+			});
+		} catch (err) {
+			console.error(`${LOG_PREFIX} index reconcile failed:`, err);
+		}
+	}
+
+	/** RPC: claim + stats used by the cron drain. */
+	async claimIndexBatch(): Promise<{ items: { path: string; text: string; hash: string }[] }> {
+		await this.ensureDocumentLoaded();
+		await this.awaitIndexReconcile();
+		const store = this.getIndexStore();
+		if (!store) return { items: [] };
+		return { items: store.claimBatch() };
+	}
+
+	async indexStats(): Promise<Record<string, number>> {
+		await this.awaitIndexReconcile();
+		const store = this.getIndexStore();
+		if (!store) return { total: 0, pending: 0, deleted: 0, indexed: 0 };
+		return store.stats();
+	}
+
+	async indexDump(): Promise<{ path: string; status: string; textLen: number; updatedAt: number; hash: string }[]> {
+		const store = this.getIndexStore();
+		if (!store) return [];
+		return store.dump();
+	}
+
+	async markIndexDone(paths: string[], chunkIds: string[]): Promise<{ ok: boolean }> {
+		const store = this.getIndexStore();
+		if (!store) return { ok: false };
+		store.markDone(paths, chunkIds);
+		return { ok: true };
+	}
+
+	/**
+	 * Fork fix: send a fresh sv-echo to each connected client after a durable
+	 * save.  Clients confirm receipts only when the server's persistence
+	 * generation advances past their capture point; without this broadcast the
+	 * generation bump is never observed until the next update message.
+	 */
+	private async broadcastSvEchoToConnections(): Promise<void> {
+		const durability = this.svEchoDurability();
+		const payload = makeSvEchoCustomMessageForDoc(this.document, durability);
+		for (const connection of this.getConnections()) {
+			try {
+				connection.send(payload);
+				this.svEchoCounters.postApplySent++;
+			} catch {
+				// A dead socket is torn down by partyserver independently.
+			}
+		}
 	}
 
 	/**
@@ -304,6 +469,23 @@ export class VaultSyncServer extends YServer<Env> {
 					"Cache-Control": "no-store",
 				},
 			});
+		}
+
+		if (request.method === "GET" && url.pathname === "/__yaos/index/claim") {
+			return Response.json(await this.claimIndexBatch());
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/index/done") {
+			const body = (await request.json()) as { paths: string[]; chunkIds: string[] };
+			return Response.json(await this.markIndexDone(body.paths ?? [], body.chunkIds ?? []));
+		}
+
+		if (request.method === "GET" && url.pathname === "/__yaos/index/stats") {
+			return Response.json(await this.indexStats());
+		}
+
+		if (request.method === "GET" && url.pathname === "/__yaos/index/dump") {
+			return Response.json(await this.indexDump());
 		}
 
 		if (request.method === "GET" && url.pathname === "/__yaos/debug") {
@@ -490,6 +672,8 @@ export class VaultSyncServer extends YServer<Env> {
 				this.documentLoaded = true;
 				this.coldLoadDurationMs = performance.now() - coldLoadStart;
 				await this.syncRoomMetaFromDocument();
+				this.attachIndexObservers();
+				await this.reconcileIndex();
 				await this.recordTrace("checkpoint-load", {
 					storage: "sql",
 					hasSnapshot: sqlState.snapshot !== null,
@@ -508,6 +692,7 @@ export class VaultSyncServer extends YServer<Env> {
 			this.documentLoaded = true;
 			this.coldLoadDurationMs = performance.now() - coldLoadStart;
 			await this.syncRoomMetaFromDocument();
+			this.attachIndexObservers();
 			await this.recordTrace("checkpoint-load", {
 				storage: "sql",
 				hasSnapshot: false,

@@ -34,6 +34,18 @@
       "bucket_name": "yaos"
     }
   ],
+  "ai": {
+    "binding": "AI"
+  },
+  "vectorize": [
+    {
+      "binding": "YAOS_VECTOR",
+      "index_name": "yaos-vault-index"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
   "assets": {
     "directory": "./public",
     "binding": "WEB_ASSETS",

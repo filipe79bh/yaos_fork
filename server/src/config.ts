@@ -1,5 +1,6 @@
 const CLAIMED_KEY = "claimed";
 const TOKEN_HASH_KEY = "tokenHash";
+const VAULTS_KEY = "vaults";
 const UPDATE_PROVIDER_KEY = "updateProvider";
 const UPDATE_REPO_URL_KEY = "updateRepoUrl";
 const UPDATE_REPO_BRANCH_KEY = "updateRepoBranch";
@@ -84,6 +85,30 @@ export class ServerConfig {
 
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+
+		if (request.method === "GET" && url.pathname === "/__yaos/vaults") {
+			const vaults = await this.state.storage.get<string[]>(VAULTS_KEY);
+			return json(vaults ?? []);
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/register-vault") {
+			let body: { vaultId?: string } = {};
+			try {
+				body = await request.json();
+			} catch {
+				return json({ error: "invalid json" }, 400);
+			}
+			if (typeof body.vaultId !== "string" || !body.vaultId || body.vaultId.length > 128) {
+				return json({ error: "invalid vaultId" }, 400);
+			}
+			await this.state.storage.transaction(async (txn) => {
+				const vaults = (await txn.get<string[]>(VAULTS_KEY)) ?? [];
+				if (!vaults.includes(body.vaultId!)) {
+					await txn.put(VAULTS_KEY, [...vaults, body.vaultId!]);
+				}
+			});
+			return json({ ok: true });
+		}
 
 		if (request.method === "GET" && url.pathname === "/__yaos/config") {
 			return json(await this.readConfig());

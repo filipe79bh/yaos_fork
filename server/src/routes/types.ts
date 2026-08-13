@@ -9,6 +9,18 @@ export interface Env {
 	YAOS_BUCKET?: R2Bucket;
 	/** Static assets binding serving the Web Vault at /web/* (custom fork). */
 	WEB_ASSETS: Fetcher;
+	/** Workers AI binding (fork feature: qwen3-embedding-0.6b). */
+	AI?: {
+		run(model: string, inputs: unknown): Promise<{ shape: [number, number]; data: number[][] }>;
+	};
+	/** Vectorize index binding (fork feature: yaos-vault-index). */
+	YAOS_VECTOR?: {
+		upsert(vectors: { id: string; values: number[]; metadata?: Record<string, unknown> }[]): Promise<unknown>;
+		query(
+			vector: number[],
+			opts: { topK: number; returnMetadata?: string; returnValues?: boolean; filter?: Record<string, unknown> },
+		): Promise<{ matches: { id: string; score: number; metadata?: Record<string, unknown> }[] }>;
+	};
 	/**
 	 * Set to any non-empty string to reject WebSocket connections that use
 	 * the legacy ?token= query parameter instead of a short-lived ticket.

@@ -19,6 +19,9 @@ import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
 import { handleTicketRoute } from "./routes/ticket";
 import { fetchVaultDebug, fetchVaultDocument, recordVaultTrace, compactVault } from "./routes/trace";
+import { drainIndexQueue, getIndexStats, runBackfill } from "./indexer";
+import { getServerByName } from "partyserver";
+import { EMBED_MODEL } from "./indexer";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 
 const LOG_PREFIX = "[yaos-sync:worker]";
@@ -45,6 +48,9 @@ type WorkerRoute =
 	| { kind: "capabilities" }
 	| { kind: "claim" }
 	| { kind: "update-metadata" }
+	| { kind: "index-status" }
+	| { kind: "index-backfill" }
+	| { kind: "search" }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
 	| { kind: "not-found" };
@@ -194,6 +200,18 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "update-metadata" };
 	}
 
+	if (req.method === "GET" && url.pathname === "/api/index/status") {
+		return { kind: "index-status" };
+	}
+
+	if (req.method === "POST" && url.pathname === "/api/index/backfill") {
+		return { kind: "index-backfill" };
+	}
+
+	if (req.method === "GET" && url.pathname === "/api/search") {
+		return { kind: "search" };
+	}
+
 	// parseSyncPath MUST run before parseVaultPath.  /vault/sync/:vaultId
 	// would otherwise be misread as vaultId="sync", resource=:vaultId and then
 	// rejected by the resource whitelist as not-found.
@@ -238,6 +256,9 @@ function routeBucket(route: WorkerRoute): string {
 		case "capabilities": return "api_capabilities";
 		case "claim": return "claim";
 		case "update-metadata": return "api_update_metadata";
+		case "index-status": return "api_index_status";
+		case "index-backfill": return "api_index_backfill";
+		case "search": return "api_search";
 		case "sync-socket": return "vault_sync";
 		case "vault": return `vault_${route.resource}`;
 		case "not-found": return "not_found";
@@ -349,7 +370,71 @@ async function handleCapabilities(req: Request, env: Env, authState: AuthStateCa
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
+/** Public-route DO stub helper (room-name flow, same as sync). */
+function vaultStubPublic(env: Env, vaultId: string): Promise<DurableObjectStub> {
+	return getServerByName(env.YAOS_SYNC, vaultId);
+}
+
+/**
+ * Fork feature: semantic search. Embed the query, query the Vectorize index,
+ * and resolve top hits to note paths + snippet text via the vault DO.
+ */
+async function handleSearch(req: Request, env: Env, query: string, limit: number): Promise<Response> {
+	const index = env.YAOS_VECTOR;
+	const ai = env.AI;
+	if (!index || !ai) {
+		return json({ error: "indexing not configured" }, 503);
+	}
+
+	const configId = env.YAOS_CONFIG.idFromName("global-config");
+	const vaults = await env.YAOS_CONFIG.get(configId).fetch("https://internal/__yaos/vaults")
+		.then((r) => (r.ok ? r.json() as Promise<string[]> : []))
+		.catch(() => []);
+
+	const results: Record<string, unknown> = {};
+	for (const vaultId of vaults) {
+		try {
+			const emb = await ai.run(EMBED_MODEL, { text: [query] }) as { shape: [number, number]; data: number[][] };
+			const queryVec = emb.data[0];
+			if (!queryVec) throw new Error("embedding returned no vector");
+			const matches = await index.query(queryVec, {
+				topK: limit,
+				returnMetadata: "all",
+				returnValues: false,
+			});
+			results[vaultId] = matches.matches.map((m) => ({
+				id: m.id,
+				path: (m.metadata as Record<string, unknown> | undefined)?.path ?? null,
+				score: m.score,
+			}));
+		} catch (err) {
+			results[vaultId] = { error: String(err) };
+		}
+	}
+	return json(results);
+}
+
 const worker = {
+	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+		// Fork feature: hourly index drain. Enumerate registered vaults and
+		// drain each one's pending embed queue.
+		try {
+			const configId = env.YAOS_CONFIG.idFromName("global-config");
+			const configStub = env.YAOS_CONFIG.get(configId);
+			const vaultsRes = await configStub.fetch("https://internal/__yaos/vaults");
+			const vaults = vaultsRes.ok ? ((await vaultsRes.json()) as string[]) : [];
+			for (const vaultId of vaults) {
+				ctx.waitUntil(
+					drainIndexQueue(env, vaultId).catch((err) => {
+						console.error(`[yaos-indexer] drain failed for ${vaultId}:`, err);
+					}),
+				);
+			}
+		} catch (err) {
+			console.error("[yaos-indexer] scheduled drain error:", err);
+		}
+	},
+
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(req.url);
@@ -411,6 +496,57 @@ const worker = {
 			response = await handleClaimRoute(req, env, authState);
 		} else if (route.kind === "update-metadata") {
 			response = withCors(await handleUpdateMetadataRoute(req, env, authState));
+		} else if (route.kind === "index-status") {
+			// Fork feature: per-vault index queue stats (auth required).
+			const token = getHttpAuthToken(req);
+			if (!(await isAuthorized(authState, token))) {
+				response = withCors(json({ error: "unauthorized" }, 401));
+			} else {
+				const configId = env.YAOS_CONFIG.idFromName("global-config");
+				const vaults = await env.YAOS_CONFIG.get(configId).fetch("https://internal/__yaos/vaults")
+					.then((r) => (r.ok ? r.json() as Promise<string[]> : []))
+					.catch(() => []);
+				const out: Record<string, unknown> = {};
+				for (const vaultId of vaults) {
+					const stats: Record<string, unknown> = await getIndexStats(env, vaultId).catch(() => ({}));
+					if (url.searchParams.get("dump") === "1") {
+						const dumpRes = await (await vaultStubPublic(env, vaultId)).fetch("https://internal/__yaos/index/dump");
+						stats.dump = dumpRes.ok ? await dumpRes.json() : null;
+					}
+					out[vaultId] = stats;
+				}
+				response = withCors(json(out));
+			}
+		} else if (route.kind === "index-backfill") {
+			// Fork feature: resumable HTTP backfill (auth required).
+			const token = getHttpAuthToken(req);
+			if (!(await isAuthorized(authState, token))) {
+				response = withCors(json({ error: "unauthorized" }, 401));
+			} else {
+				const configId = env.YAOS_CONFIG.idFromName("global-config");
+				const vaults = await env.YAOS_CONFIG.get(configId).fetch("https://internal/__yaos/vaults")
+					.then((r) => (r.ok ? r.json() as Promise<string[]> : []))
+					.catch(() => []);
+				const results: Record<string, unknown> = {};
+				for (const vaultId of vaults) {
+					results[vaultId] = await runBackfill(env, vaultId).catch((err) => ({ error: String(err) }));
+				}
+				response = withCors(json(results));
+			}
+		} else if (route.kind === "search") {
+			// Fork feature: semantic search over the vault (auth required).
+			const token = getHttpAuthToken(req);
+			if (!(await isAuthorized(authState, token))) {
+				response = withCors(json({ error: "unauthorized" }, 401));
+			} else {
+				const query = url.searchParams.get("q") ?? "";
+				const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 10)));
+				if (!query.trim()) {
+					response = withCors(json({ error: "missing q" }, 400));
+				} else {
+					response = withCors(await handleSearch(req, env, query, limit));
+				}
+			}
 		} else if (route.kind === "sync-socket") {
 			response = await handleSyncSocketRoute(req, env, authState, route.vaultId);
 		} else {
@@ -426,6 +562,14 @@ const worker = {
 			} else if (resource === "debug" && req.method === "POST" && rest[0] === "compact") {
 				response = withCors(await compactVault(env, vaultId));
 			} else if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
+				// Fork feature: register this vault for the index cron on first
+				// authenticated touch (cheap, idempotent).
+				const configId = env.YAOS_CONFIG.idFromName("global-config");
+				await env.YAOS_CONFIG.get(configId).fetch("https://internal/__yaos/register-vault", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ vaultId }),
+				});
 				response = withCors(await handleTicketRoute(req, authState, vaultId, json, env));
 			} else if (resource === "blobs") {
 				response = withCors(await handleBlobRoute(env, vaultId, req, rest, json));
