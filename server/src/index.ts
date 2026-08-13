@@ -40,6 +40,7 @@ const LOG_PREFIX = "[yaos-sync:worker]";
 type WorkerRoute =
 	| { kind: "cors-preflight" }
 	| { kind: "home" }
+	| { kind: "web" }
 	| { kind: "mobile-setup" }
 	| { kind: "capabilities" }
 	| { kind: "claim" }
@@ -172,6 +173,11 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "home" };
 	}
 
+	// Web Vault (custom fork): /web and /web/* are served from static assets.
+	if (req.method === "GET" && (url.pathname === "/web" || url.pathname.startsWith("/web/"))) {
+		return { kind: "web" };
+	}
+
 	if (req.method === "GET" && url.pathname === "/mobile-setup") {
 		return { kind: "mobile-setup" };
 	}
@@ -227,6 +233,7 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 function routeBucket(route: WorkerRoute): string {
 	switch (route.kind) {
 		case "home": return "home";
+		case "web": return "web";
 		case "mobile-setup": return "mobile_setup";
 		case "capabilities": return "api_capabilities";
 		case "claim": return "claim";
@@ -382,6 +389,15 @@ const worker = {
 					deployRepo: canonicalRepoForSetup(env),
 				});
 			response = html(body);
+		} else if (route.kind === "web") {
+			// Web Vault (custom fork): serve static assets at /web/*.
+			// /web → /web/ so the assets index.html is picked up.
+			const targetUrl = url.pathname === "/web"
+				? new URL("/web/", req.url)
+				: url;
+			const assetReq = new Request(targetUrl.toString(), req);
+			const assetRes = await env.WEB_ASSETS.fetch(assetReq);
+			response = assetRes;
 		} else if (route.kind === "mobile-setup") {
 			response = html(
 				renderMobileSetupPage({

@@ -1,0 +1,48 @@
+{
+  "name": "yaos",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-02",
+  "custom_domains": [
+    {
+      "name": "obsidian.filipe.uk"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "YAOS_SYNC",
+        "class_name": "VaultSyncServer"
+      },
+      {
+        "name": "YAOS_CONFIG",
+        "class_name": "ServerConfig"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "VaultSyncServer",
+        "ServerConfig"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "YAOS_BUCKET",
+      "bucket_name": "yaos"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "WEB_ASSETS",
+    "not_found_handling": "none",
+    "run_worker_first": true
+  },
+  "observability": {
+    "logs": {
+      "enabled": true
+    }
+  }
+}
