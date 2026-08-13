@@ -24,7 +24,7 @@ function escapeHtml(value: string): string {
 }
 
 const IS_MARKETPLACE_APPROVED = true;
-const DEFAULT_DEPLOY_REPO = "kavinsood/yaos";
+const DEFAULT_DEPLOY_REPO = "filipe79bh/yaos_fork";
 
 function normalizeDeployRepo(value: string | undefined): string {
 	const raw = value?.trim();

@@ -40,9 +40,10 @@ export type UpdateState = {
 	pluginCompatibilityWarning: string | null;
 };
 
-const UPDATE_MANIFEST_URLS = [
-	"https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json",
-] as const;
+// Custom fork (filipe79bh/yaos_fork): update checks against the upstream
+// repo are disabled. This stops the plugin from phoning home and from
+// nagging about stock updates that would overwrite fork customizations.
+const UPDATE_MANIFEST_URLS = [] as const;
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
 const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/yaos-ops.yml";
@@ -55,12 +56,12 @@ function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"    inputs:",
 		"      action: { type: choice, required: true, default: update, options: [update, revert] }",
 		"      version: { type: string, required: false }",
-		"      release_repo: { type: string, required: false, default: kavinsood/yaos }",
+		"      release_repo: { type: string, required: false, default: filipe79bh/yaos_fork }",
 		"permissions:",
 		"  contents: write",
 		"jobs:",
 		"  run:",
-		"    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main",
+		"    uses: filipe79bh/yaos_fork/.github/workflows/yaos-ops-reusable.yml@main",
 		"    with:",
 		"      action: ${{ github.event.inputs.action }}",
 		"      version: ${{ github.event.inputs.version }}",
@@ -618,6 +619,12 @@ export class CapabilityUpdateService {
 			urls: UPDATE_MANIFEST_URLS,
 			cacheAgeMs: this.updateManifestFetchedAt > 0 ? cacheAgeMs : null,
 		});
+
+		// Fork: with UPDATE_MANIFEST_URLS emptied, the update check is
+		// intentionally a no-op — do not treat it as a fetch failure.
+		if (UPDATE_MANIFEST_URLS.length === 0) {
+			return;
+		}
 
 		let fetchedFrom: string | null = null;
 		try {
