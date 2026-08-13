@@ -91,7 +91,7 @@ interface SqlStorageCursor<T> {
 	[Symbol.iterator](): Iterator<T>;
 }
 
-interface DurableObjectStorageWithSql {
+export interface DurableObjectStorageWithSql {
 	sql: SqlStorage;
 	transactionSync<T>(closure: () => T): T;
 }
